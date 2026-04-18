@@ -1,0 +1,39 @@
+{
+  "name": "async-bulkhead-express",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Express middleware for route-level bulkheads and fail-fast overload protection.",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test",
+    "verify": "npm run build && node manual-verify.mjs"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "express": "^5.1.0",
+    "async-bulkhead-ts": "0.4.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}
