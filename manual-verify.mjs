@@ -36,7 +36,18 @@ async function testNormal() {
     const response = await fetch(`${baseUrl}/search`);
     assert.equal(response.status, 200);
     assert.deepEqual(await response.json(), { ok: true });
-    assert.deepEqual(bulkhead.stats(), { name: 'search', inFlight: 0, pending: 0, maxConcurrent: 1, maxQueue: 0, closed: false });
+    const stats = bulkhead.stats();
+    assert.equal(stats.name, 'search');
+    assert.equal(stats.inFlight, 0);
+    assert.equal(stats.pending, 0);
+    assert.equal(stats.maxConcurrent, 1);
+    assert.equal(stats.maxQueue, 0);
+    assert.equal(stats.closed, false);
+    assert.equal(stats.totalAdmitted, 1);
+    assert.equal(stats.totalReleased, 1);
+    assert.equal(stats.rejected, 0);
+    assert.deepEqual(stats.rejectedByReason, {});
+    assert.equal(stats.hookErrors, 0);
   } finally {
     await closeServer(server);
   }

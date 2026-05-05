@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog.
 This project adheres to Semantic Versioning.
 
+## [0.3.0] - 2026-05-04
+
+### Added
+
+- Express 4-compatible async error forwarding around middleware execution
+- Runtime validation for `options`, `maxConcurrent`, `maxQueue`, and `pathMode`
+- Async hook rejection swallowing for `onAdmit`, `onReject`, and `onRelease`
+- Richer `stats()` counters, including total admitted/released/rejected counts, Express-mapped rejection reasons, and hook error counts
+- JSDoc guidance for route-label cardinality, sub-router mount semantics, local process scope, and HTTP lifecycle scope
+- README deployment and observability guidance
+- Regression tests for custom reject fallbacks, partial custom responses, async hooks, skipped-route errors, route/metadata callback failures, queued close behavior, `abortOnClientClose: false`, event stats snapshots, and stats counters
+
+### Changed
+
+- `express` is now declared as a peer dependency supporting Express 4.18+ and Express 5.x
+- `manual-verify.mjs` is treated as a smoke test via `npm run smoke`; `npm run verify` runs tests and smoke verification
+- Timing-sensitive tests now use request latches instead of fixed startup sleeps
+- Request wait and hold durations now use monotonic `performance.now()` timing while event timestamps remain wall-clock milliseconds
+
+### Fixed
+
+- Custom reject handlers that partially write a response are now ended instead of leaving clients hanging
+- Removed accidental trailing Markdown fence text from the TypeScript source
+- Removed deprecated request `aborted` event listener usage in favor of response `close` lifecycle handling
+- Removed unreachable route-path handling branch from internal observed-path logic
+
 ## [0.2.0] - 2026-04-27
 
 ### Added

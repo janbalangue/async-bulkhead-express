@@ -1,8 +1,25 @@
 {
   "name": "async-bulkhead-express",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": false,
   "description": "Express middleware for route-level bulkheads and fail-fast overload protection.",
+  "keywords": [
+    "express",
+    "express-middleware",
+    "middleware",
+    "bulkhead",
+    "bulkhead-pattern",
+    "overload-protection",
+    "admission-control",
+    "concurrency-limit",
+    "concurrency-control",
+    "rate-limit",
+    "resilience",
+    "latency",
+    "queue-timeout",
+    "nodejs",
+    "typescript"
+  ],
   "type": "module",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
@@ -19,21 +36,27 @@
     "dist",
     "README.md",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test",
-    "verify": "npm run build && node manual-verify.mjs"
+    "test": "npm run build && node --test test/*.test.mjs",
+    "smoke": "npm run build && node manual-verify.mjs",
+    "verify": "npm run test && npm run smoke"
   },
   "license": "Apache-2.0",
   "dependencies": {
-    "express": "^5.1.0",
     "async-bulkhead-ts": "0.4.1"
   },
   "devDependencies": {
+    "express": "^5.1.0",
     "@types/express": "^5.0.3",
     "@types/node": "^24.0.0",
     "typescript": "^5.8.3"
+  },
+  "sideEffects": false,
+  "peerDependencies": {
+    "express": "^4.18.0 || ^5.0.0"
   }
 }

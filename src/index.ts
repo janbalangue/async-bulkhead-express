@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import type { NextFunction, Request, RequestHandler, Response } from "express";
 import {
   createBulkhead,
@@ -6,6 +7,12 @@ import {
   type Token,
 } from "async-bulkhead-ts";
 
+export type ExpressBulkheadRejectReason =
+  | "bulkhead_rejected"
+  | "bulkhead_closed"
+  | "queue_timeout"
+  | "request_aborted";
+
 export interface ExpressBulkheadStats {
   name?: string;
   inFlight: number;
@@ -13,19 +20,29 @@ export interface ExpressBulkheadStats {
   maxConcurrent: number;
   maxQueue: number;
   closed: boolean;
+  totalAdmitted: number;
+  totalReleased: number;
+  rejected: number;
+  rejectedByReason: Partial<Record<ExpressBulkheadRejectReason, number>>;
+  aborted?: number;
+  timedOut?: number;
+  doubleRelease?: number;
+  inFlightUnderflow?: number;
+  hookErrors: number;
 }
-
-export type ExpressBulkheadRejectReason =
-  | "bulkhead_rejected"
-  | "bulkhead_closed"
-  | "queue_timeout"
-  | "request_aborted";
 
 export type ExpressBulkheadReleaseCause = "finish" | "close";
 
 export type ExpressBulkheadPathMode = "path" | "originalUrl" | "route";
 
 export type ExpressBulkheadMetadata = Record<string, unknown>;
+
+type ExpressBulkheadObservedPathMode = Exclude<
+  ExpressBulkheadPathMode,
+  "route"
+>;
+
+type ExpressBulkheadHook<T> = (event: T) => void | Promise<void>;
 
 interface ExpressBulkheadEventBase extends ExpressBulkheadStats {
   method: string;
@@ -56,6 +73,17 @@ export interface ExpressBulkheadRejectResponseContext extends ExpressBulkheadRej
   res: Response;
 }
 
+/**
+ * Configuration for an Express bulkhead.
+ *
+ * Bulkheads in this package are local to the current Node.js process. If an app
+ * runs multiple worker processes, containers, or pods, each one has its own
+ * independent capacity pool. Size limits per process, not globally.
+ *
+ * Path and route fields are observability labels. Prefer stable,
+ * low-cardinality values such as `GET /users/:id`; avoid raw user IDs, query
+ * strings, tenant IDs, or other unbounded values in metric labels.
+ */
 export interface ExpressBulkheadOptions {
   name?: string;
   maxConcurrent: number;
@@ -64,19 +92,39 @@ export interface ExpressBulkheadOptions {
   /** Maximum time a queued request may wait for capacity. Applies to queue wait only. */
   queueWaitTimeoutMs?: number;
 
-  /** Abort queued acquisition when the client disconnects. Defaults to true. */
+  /**
+   * Abort queued acquisition when the HTTP connection closes before admission.
+   * Defaults to true. This is based on the Node/Express response close lifecycle
+   * for HTTP/1.1 requests handled by this process.
+   */
   abortOnClientClose?: boolean;
 
   /** Skip bulkhead admission for selected requests, such as health checks or CORS preflight. */
   skip?: (req: Request) => boolean;
 
-  /** Controls the high-level path string attached to hook events. Defaults to `path`. */
+  /**
+   * Controls the path string attached to hook events. Defaults to `path`.
+   *
+   * With router-level middleware mounted via `app.use('/api', bulkhead.middleware(), router)`,
+   * the bulkhead can run before Express has selected a leaf route. In that case
+   * `pathMode: 'route'` may fall back to `req.path` unless `routeLabel` is set.
+   */
   pathMode?: ExpressBulkheadPathMode;
 
-  /** Stable low-cardinality route label for observability. */
+  /**
+   * Stable low-cardinality route label for observability.
+   *
+   * Use this when middleware is mounted on a sub-router or when you want metric
+   * labels such as `API router` or `GET /users/:id` instead of raw request paths.
+   */
   routeLabel?: string | ((req: Request) => string | undefined);
 
-  /** Request-scoped metadata attached to hook events and reject-response context. */
+  /**
+   * Request-scoped metadata attached to hook events and reject-response context.
+   *
+   * Do not use metadata as metric labels unless the values are bounded; request
+   * IDs and user IDs are better suited to logs/traces than time-series labels.
+   */
   metadata?: (req: Request) => ExpressBulkheadMetadata | undefined;
 
   /** Custom overload response. If it does not send a response, the default 503 body is used. */
@@ -84,9 +132,9 @@ export interface ExpressBulkheadOptions {
     context: ExpressBulkheadRejectResponseContext,
   ) => void | Promise<void>;
 
-  onAdmit?: (event: ExpressBulkheadAdmitEvent) => void;
-  onReject?: (event: ExpressBulkheadRejectEvent) => void;
-  onRelease?: (event: ExpressBulkheadReleaseEvent) => void;
+  onAdmit?: ExpressBulkheadHook<ExpressBulkheadAdmitEvent>;
+  onReject?: ExpressBulkheadHook<ExpressBulkheadRejectEvent>;
+  onRelease?: ExpressBulkheadHook<ExpressBulkheadReleaseEvent>;
 }
 
 export interface ExpressBulkhead {
@@ -96,10 +144,66 @@ export interface ExpressBulkhead {
   drain(): Promise<void>;
 }
 
+type StatsWithOptionalCounters = Stats & {
+  totalAdmitted?: number;
+  totalReleased?: number;
+  aborted?: number;
+  timedOut?: number;
+  rejected?: number;
+  rejectedByReason?: Partial<Record<RejectReason, number>>;
+  doubleRelease?: number;
+  inFlightUnderflow?: number;
+  hookErrors?: number;
+};
+
+function addRejectReason(
+  target: Partial<Record<ExpressBulkheadRejectReason, number>>,
+  reason: ExpressBulkheadRejectReason,
+  count: number | undefined,
+): void {
+  if (!count) return;
+  target[reason] = (target[reason] ?? 0) + count;
+}
+
+function mapRejectedByReason(
+  rejectedByReason: StatsWithOptionalCounters["rejectedByReason"] = {},
+): Partial<Record<ExpressBulkheadRejectReason, number>> {
+  const mapped: Partial<Record<ExpressBulkheadRejectReason, number>> = {};
+
+  for (const [rawReason, count] of Object.entries(rejectedByReason)) {
+    addRejectReason(mapped, mapRejectReason(rawReason as RejectReason), count);
+  }
+
+  return mapped;
+}
+
 function mapStats(
   name: string | undefined,
   stats: Stats,
+  expressHookErrors = 0,
 ): ExpressBulkheadStats {
+  const extended = stats as StatsWithOptionalCounters;
+  const rejectedByReason = mapRejectedByReason(extended.rejectedByReason);
+
+  if (
+    extended.aborted !== undefined &&
+    extended.aborted > 0 &&
+    rejectedByReason.request_aborted === undefined
+  ) {
+    rejectedByReason.request_aborted = extended.aborted;
+  }
+  if (
+    extended.timedOut !== undefined &&
+    extended.timedOut > 0 &&
+    rejectedByReason.queue_timeout === undefined
+  ) {
+    rejectedByReason.queue_timeout = extended.timedOut;
+  }
+
+  const rejected =
+    extended.rejected ??
+    Object.values(rejectedByReason).reduce((total, count) => total + count, 0);
+
   return {
     ...(name !== undefined ? { name } : {}),
     inFlight: stats.inFlight,
@@ -107,6 +211,19 @@ function mapStats(
     maxConcurrent: stats.maxConcurrent,
     maxQueue: stats.maxQueue,
     closed: stats.closed,
+    totalAdmitted: extended.totalAdmitted ?? 0,
+    totalReleased: extended.totalReleased ?? 0,
+    rejected,
+    rejectedByReason,
+    ...(extended.aborted !== undefined ? { aborted: extended.aborted } : {}),
+    ...(extended.timedOut !== undefined ? { timedOut: extended.timedOut } : {}),
+    ...(extended.doubleRelease !== undefined
+      ? { doubleRelease: extended.doubleRelease }
+      : {}),
+    ...(extended.inFlightUnderflow !== undefined
+      ? { inFlightUnderflow: extended.inFlightUnderflow }
+      : {}),
+    hookErrors: (extended.hookErrors ?? 0) + expressHookErrors,
   };
 }
 
@@ -125,8 +242,10 @@ function mapRejectReason(reason: RejectReason): ExpressBulkheadRejectReason {
   return "bulkhead_rejected";
 }
 
-function getObservedPath(req: Request, mode: ExpressBulkheadPathMode): string {
-  if (mode === "route") return getRoute(req) ?? getObservedPath(req, "path");
+function getObservedPath(
+  req: Request,
+  mode: ExpressBulkheadObservedPathMode,
+): string {
   if (mode === "originalUrl") {
     if (typeof req.originalUrl === "string" && req.originalUrl.length > 0)
       return req.originalUrl;
@@ -182,12 +301,19 @@ function getMetadata(
   }
 }
 
-function callHook<T>(hook: ((event: T) => void) | undefined, event: T): void {
+function callHook<T>(
+  hook: ExpressBulkheadHook<T> | undefined,
+  event: T,
+  onError: () => void,
+): void {
   if (!hook) return;
   try {
-    hook(event);
+    const result = hook(event);
+    if (result && typeof result.catch === "function") {
+      result.catch(onError);
+    }
   } catch {
-    // Hook exceptions must not break request flow.
+    onError();
   }
 }
 
@@ -206,7 +332,31 @@ function defaultReject(
   res.status(503).json({ error: "service_unavailable", reason });
 }
 
-function validateOptions(options: ExpressBulkheadOptions): void {
+function assertPositiveInteger(value: number, name: string): void {
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+}
+
+function assertNonNegativeInteger(value: number, name: string): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be an integer >= 0`);
+  }
+}
+
+function validateOptions(
+  options: ExpressBulkheadOptions | null | undefined,
+): asserts options is ExpressBulkheadOptions {
+  if (options === null || options === undefined || typeof options !== "object") {
+    throw new Error("options must be an object");
+  }
+
+  assertPositiveInteger(options.maxConcurrent, "maxConcurrent");
+
+  if (options.maxQueue !== undefined) {
+    assertNonNegativeInteger(options.maxQueue, "maxQueue");
+  }
+
   if (options.queueWaitTimeoutMs !== undefined) {
     if (
       !Number.isFinite(options.queueWaitTimeoutMs) ||
@@ -214,6 +364,15 @@ function validateOptions(options: ExpressBulkheadOptions): void {
     ) {
       throw new Error("queueWaitTimeoutMs must be a finite number >= 0");
     }
+  }
+
+  if (
+    options.pathMode !== undefined &&
+    options.pathMode !== "path" &&
+    options.pathMode !== "originalUrl" &&
+    options.pathMode !== "route"
+  ) {
+    throw new Error("pathMode must be one of: path, originalUrl, route");
   }
 }
 
@@ -227,8 +386,12 @@ export function createExpressBulkhead(
     ...(options.name !== undefined ? { name: options.name } : {}),
     ...(options.maxQueue !== undefined ? { maxQueue: options.maxQueue } : {}),
   });
+  let expressHookErrors = 0;
+  const recordHookError = (): void => {
+    expressHookErrors += 1;
+  };
   const stats = (): ExpressBulkheadStats =>
-    mapStats(options.name, bulkhead.stats());
+    mapStats(options.name, bulkhead.stats(), expressHookErrors);
   const pathMode = options.pathMode ?? "path";
   const abortOnClientClose = options.abortOnClientClose ?? true;
 
@@ -254,7 +417,7 @@ export function createExpressBulkhead(
     next: NextFunction,
     event: ExpressBulkheadRejectEvent,
   ): Promise<void> => {
-    callHook(options.onReject, event);
+    callHook(options.onReject, event, recordHookError);
 
     if (event.reason === "request_aborted" || responseClosed(req, res)) return;
 
@@ -266,100 +429,100 @@ export function createExpressBulkhead(
         return;
       }
 
-      if (responseClosed(req, res) || res.headersSent) return;
+      if (responseClosed(req, res)) return;
     }
 
     defaultReject(res, event.reason);
   };
 
   const middleware = (): RequestHandler => {
-    return async (req: Request, res: Response, next: NextFunction) => {
-      try {
+    return (req: Request, res: Response, next: NextFunction) => {
+      void (async (): Promise<void> => {
         if (options.skip?.(req)) {
           next();
           return;
         }
-      } catch (err) {
-        next(err);
-        return;
-      }
 
-      const acquireStartedAt = Date.now();
-      const queued = stats().inFlight >= options.maxConcurrent;
-      const abortController = abortOnClientClose
-        ? new AbortController()
-        : undefined;
-      let closedBeforeAdmission = false;
+        const acquireStartedAt = performance.now();
+        const queued = stats().inFlight >= options.maxConcurrent;
+        const abortController = abortOnClientClose
+          ? new AbortController()
+          : undefined;
+        let closedBeforeAdmission = false;
 
-      const abortAcquire = (): void => {
-        closedBeforeAdmission = true;
-        abortController?.abort();
-      };
-
-      if (abortController) {
-        req.once("aborted", abortAcquire);
-        res.once("close", abortAcquire);
-      }
-
-      const cleanupAcquireAbort = (): void => {
-        if (!abortController) return;
-        req.off("aborted", abortAcquire);
-        res.off("close", abortAcquire);
-      };
-
-      const acquireResult = await bulkhead.acquire({
-        ...(abortController ? { signal: abortController.signal } : {}),
-        ...(options.queueWaitTimeoutMs !== undefined
-          ? { timeoutMs: options.queueWaitTimeoutMs }
-          : {}),
-      });
-
-      cleanupAcquireAbort();
-
-      if (!acquireResult.ok) {
-        const event: ExpressBulkheadRejectEvent = {
-          ...eventBase(req),
-          rejectedAt: Date.now(),
-          reason: mapRejectReason(acquireResult.reason),
+        const abortAcquire = (): void => {
+          closedBeforeAdmission = true;
+          abortController?.abort();
         };
-        await handleReject(req, res, next, event);
-        return;
-      }
 
-      const token: Token = acquireResult.token;
-      const admittedAt = Date.now();
+        if (abortController) {
+          res.once("close", abortAcquire);
+        }
 
-      if (closedBeforeAdmission || responseClosed(req, res)) {
-        token.release();
-        return;
-      }
-
-      let released = false;
-      const release = (releaseCause: ExpressBulkheadReleaseCause): void => {
-        if (released) return;
-        released = true;
-        token.release();
-        const releasedAt = Date.now();
-        const event: ExpressBulkheadReleaseEvent = {
-          ...eventBase(req),
-          releasedAt,
-          durationMs: releasedAt - admittedAt,
-          releaseCause,
+        const cleanupAcquireAbort = (): void => {
+          if (!abortController) return;
+          res.off("close", abortAcquire);
         };
-        callHook(options.onRelease, event);
-      };
 
-      res.once("finish", () => release("finish"));
-      res.once("close", () => release("close"));
+        const acquireResult = await bulkhead.acquire({
+          ...(abortController ? { signal: abortController.signal } : {}),
+          ...(options.queueWaitTimeoutMs !== undefined
+            ? { timeoutMs: options.queueWaitTimeoutMs }
+            : {}),
+        });
 
-      callHook(options.onAdmit, {
-        ...eventBase(req),
-        admittedAt,
-        queued,
-        waitMs: admittedAt - acquireStartedAt,
-      });
+        cleanupAcquireAbort();
 
-      next();
+        if (!acquireResult.ok) {
+          const event: ExpressBulkheadRejectEvent = {
+            ...eventBase(req),
+            rejectedAt: Date.now(),
+            reason: mapRejectReason(acquireResult.reason),
+          };
+          await handleReject(req, res, next, event);
+          return;
+        }
+
+        const token: Token = acquireResult.token;
+        const admittedAt = Date.now();
+        const admittedAtMono = performance.now();
+
+        if (closedBeforeAdmission || responseClosed(req, res)) {
+          token.release();
+          return;
+        }
+
+        let released = false;
+        const release = (releaseCause: ExpressBulkheadReleaseCause): void => {
+          if (released) return;
+          released = true;
+          token.release();
+          const releasedAt = Date.now();
+          const event: ExpressBulkheadReleaseEvent = {
+            ...eventBase(req),
+            releasedAt,
+            durationMs: performance.now() - admittedAtMono,
+            releaseCause,
+          };
+          callHook(options.onRelease, event, recordHookError);
+        };
+
+        res.once("finish", () => release("finish"));
+        res.once("close", () => release("close"));
+
+        callHook(
+          options.onAdmit,
+          {
+            ...eventBase(req),
+            admittedAt,
+            queued,
+            waitMs: admittedAtMono - acquireStartedAt,
+          },
+          recordHookError,
+        );
+
+        next();
+      })().catch(next);
     };
   };
 
@@ -376,4 +539,3 @@ export function createBulkheadMiddleware(
 ): RequestHandler {
   return createExpressBulkhead(options).middleware();
 }
-``;

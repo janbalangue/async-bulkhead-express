@@ -35,6 +35,10 @@ This package models service overload, not client abuse or per-user quota exhaust
 npm i async-bulkhead-express express
 ```
 
+## Compatibility
+
+This package supports Express 4.18+ and Express 5.x. The middleware does not rely on Express 5-only promise handling; asynchronous middleware failures are forwarded with `next(err)` for compatibility with both major Express lines.
+
 ## Quick start
 
 ### Protect a single route
@@ -177,9 +181,9 @@ interface ExpressBulkheadOptions {
   routeLabel?: string | ((req: Request) => string | undefined);
   metadata?: (req: Request) => Record<string, unknown> | undefined;
   rejectResponse?: (context: ExpressBulkheadRejectResponseContext) => void | Promise<void>;
-  onAdmit?: (event: ExpressBulkheadAdmitEvent) => void;
-  onReject?: (event: ExpressBulkheadRejectEvent) => void;
-  onRelease?: (event: ExpressBulkheadReleaseEvent) => void;
+  onAdmit?: (event: ExpressBulkheadAdmitEvent) => void | Promise<void>;
+  onReject?: (event: ExpressBulkheadRejectEvent) => void | Promise<void>;
+  onRelease?: (event: ExpressBulkheadReleaseEvent) => void | Promise<void>;
 }
 ```
 
@@ -193,6 +197,15 @@ interface ExpressBulkheadStats {
   maxConcurrent: number;
   maxQueue: number;
   closed: boolean;
+  totalAdmitted: number;
+  totalReleased: number;
+  rejected: number;
+  rejectedByReason: Partial<Record<ExpressBulkheadRejectReason, number>>;
+  aborted?: number;
+  timedOut?: number;
+  doubleRelease?: number;
+  inFlightUnderflow?: number;
+  hookErrors: number;
 }
 ```
 
@@ -208,6 +221,9 @@ type ExpressBulkheadRejectReason =
 
 ## Lifecycle behavior
 
+- `maxConcurrent` must be a positive integer.
+- `maxQueue` must be a non-negative integer.
+- `queueWaitTimeoutMs`, when set, must be a finite number greater than or equal to zero.
 - Admission happens before downstream route work begins.
 - Rejected requests do not call downstream handlers.
 - `maxQueue: 0` gives fail-fast behavior with no queueing.
@@ -217,20 +233,65 @@ type ExpressBulkheadRejectReason =
 - Admitted requests hold capacity until the HTTP lifecycle ends.
 - Capacity is released on `finish` or `close`, whichever happens first.
 - Duplicate lifecycle events do not double-release capacity.
+- Hook event stats are post-transition snapshots: admit events report stats after admission, release events report stats after release, and reject events report stats after rejection.
 
 ## Hooks
 
-Hooks are synchronous fire-and-forget observability callbacks:
+Hooks are fire-and-forget observability callbacks:
 
 - `onAdmit`
 - `onReject`
 - `onRelease`
 
-Hook exceptions are swallowed so observability code does not break request flow.
+Synchronous hook exceptions and asynchronous hook rejections are swallowed so observability code does not break request flow. Hooks are not awaited by request handling.
+
+
+## Deployment and observability guidance
+
+### Size limits per process
+
+Bulkheads are local to the Node.js process that creates them. If an app runs four worker processes, containers, or pods, each process gets its own independent `maxConcurrent` and `maxQueue` capacity. For example, `maxConcurrent: 10` on four pods can allow up to forty concurrent protected requests across the deployment.
+
+Pick initial values from the constrained resource you are protecting, such as database connections, CPU-heavy work, downstream concurrency, or expensive queue consumers. Start with `maxQueue: 0` for fail-fast behavior when latency matters. Use a small queue only when brief bursts are normal and a bounded wait is better than immediate rejection.
+
+### Alert on sustained rejection, not isolated bursts
+
+Use `stats().rejected`, `stats().rejectedByReason`, and hook events to distinguish overload causes:
+
+- `bulkhead_rejected`: capacity and queue are full
+- `queue_timeout`: a queued request waited longer than `queueWaitTimeoutMs`
+- `request_aborted`: the client disconnected before queued admission
+- `bulkhead_closed`: new work was rejected because the bulkhead was closed
+
+`totalAdmitted`, `totalReleased`, `inFlight`, and `pending` are useful for dashboards. `doubleRelease`, `inFlightUnderflow`, and `hookErrors` are diagnostic counters; non-zero values are worth investigating.
+
+### Keep metric labels low-cardinality
+
+Prefer `name` and `routeLabel` values such as `search`, `payments`, `GET /users/:id`, or `API router`. Avoid raw paths that contain user IDs, request IDs, search terms, tenant IDs, or query strings as metric labels. Put those values in logs or tracing metadata instead.
+
+When middleware is mounted before a sub-router, Express may not know the final leaf route yet. In that setup, set `routeLabel` explicitly if you need stable route-level metrics:
+
+```ts
+app.use(
+  '/api',
+  createBulkheadMiddleware({
+    name: 'api',
+    maxConcurrent: 50,
+    maxQueue: 0,
+    routeLabel: 'API router',
+  }),
+  apiRouter,
+);
+```
+
+### HTTP lifecycle scope
+
+Admitted requests hold capacity until Express emits `finish` or `close` on the response, whichever happens first. Queued request cancellation uses the response `close` lifecycle for client disconnect detection. This package does not cancel downstream work, enforce application-level request timeouts, or coordinate capacity across machines.
 
 ## Development
 
 ```bash
 npm test
+npm run smoke
 npm run verify
 ```
