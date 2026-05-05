@@ -318,7 +318,13 @@ function callHook<T>(
 }
 
 function responseClosed(req: Request, res: Response): boolean {
-  return req.destroyed || res.destroyed || res.writableEnded;
+  return (
+    req.destroyed ||
+    req.socket.destroyed ||
+    res.destroyed ||
+    Boolean(res.socket?.destroyed) ||
+    res.writableEnded
+  );
 }
 
 function defaultReject(
@@ -450,18 +456,21 @@ export function createExpressBulkhead(
           : undefined;
         let closedBeforeAdmission = false;
 
-        const abortAcquire = (): void => {
+        const markClosedBeforeAdmission = (): void => {
           closedBeforeAdmission = true;
           abortController?.abort();
         };
 
-        if (abortController) {
-          res.once("close", abortAcquire);
-        }
+        const acquireSocket = req.socket;
 
-        const cleanupAcquireAbort = (): void => {
-          if (!abortController) return;
-          res.off("close", abortAcquire);
+        req.once("close", markClosedBeforeAdmission);
+        res.once("close", markClosedBeforeAdmission);
+        acquireSocket.once("close", markClosedBeforeAdmission);
+
+        const cleanupAcquireClose = (): void => {
+          req.off("close", markClosedBeforeAdmission);
+          res.off("close", markClosedBeforeAdmission);
+          acquireSocket.off("close", markClosedBeforeAdmission);
         };
 
         const acquireResult = await bulkhead.acquire({
@@ -471,7 +480,7 @@ export function createExpressBulkhead(
             : {}),
         });
 
-        cleanupAcquireAbort();
+        cleanupAcquireClose();
 
         if (!acquireResult.ok) {
           const event: ExpressBulkheadRejectEvent = {

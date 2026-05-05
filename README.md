@@ -94,7 +94,7 @@ const reports = createExpressBulkhead({
 });
 ```
 
-Queued acquisition is aborted by default if the client disconnects before admission. Set `abortOnClientClose: false` only if you have a specific reason to keep queued acquisition alive after disconnect.
+Queued acquisition is aborted by default if the client disconnects before admission. Set `abortOnClientClose: false` only if you have a specific reason to keep queued acquisition alive after disconnect. When a close is observed before admission, the wrapper releases the acquired token without calling downstream handlers. Because Node/Express close events can race with admission, applications should not rely on `abortOnClientClose: false` as a guarantee that a disconnected queued request will never reach the handler.
 
 ### Customize overload responses
 
@@ -286,7 +286,12 @@ app.use(
 
 ### HTTP lifecycle scope
 
-Admitted requests hold capacity until Express emits `finish` or `close` on the response, whichever happens first. Queued request cancellation uses the response `close` lifecycle for client disconnect detection. This package does not cancel downstream work, enforce application-level request timeouts, or coordinate capacity across machines.
+Admitted requests hold capacity until Express emits `finish` or `close` on the response, whichever happens first. Queued request cancellation uses the request/response/socket `close` lifecycle for client disconnect detection. This package does not cancel downstream work, enforce application-level request timeouts, or coordinate capacity across machines.
+
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
 
 ## Development
 
