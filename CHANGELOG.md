@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog.
 This project adheres to Semantic Versioning.
 
+## [0.3.1] - 2026-05-11
+
+### Removed
+
+- Removed the `NOTICE` file from the published package/repository to avoid incorrect license-scan classification in Snyk for the npm library.
+
 ## [0.3.0] - 2026-05-04
 
 ### Added
